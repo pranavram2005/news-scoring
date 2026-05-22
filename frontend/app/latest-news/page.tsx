@@ -1,7 +1,7 @@
 import { LatestNewsDashboard } from "@/components/latest-news-dashboard";
 import { getNewsPreviews, type NewsPreviewArticle } from "@/lib/api";
 
-export default async function Page() {
+export default async function LatestNewsPage() {
   let articles: NewsPreviewArticle[] = [];
   let error: string | null = null;
 

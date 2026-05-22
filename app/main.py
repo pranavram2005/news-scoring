@@ -1,26 +1,28 @@
-import logging
-import os
-
 from fastapi import Depends, FastAPI, HTTPException
-from celery.exceptions import CeleryError
-from kombu.exceptions import KombuError
-from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.celery_app import celery_app
 from app.db.database import get_db
-from app.db.models import ArticleScore
-from app.db.repositories import create_article_score, delete_article_score, get_article_score, get_article_scores
-from app.schemas import AnalyzeRequest, ArticleScoreResponse, TaskEnqueuedResponse, TaskStatusResponse
+from app.db.repositories import (
+    create_article_score,
+    create_ingested_article_score,
+    delete_all_article_scores,
+    delete_article_score,
+    get_article_score_by_url,
+    get_article_scores,
+    get_latest_news_scores,
+)
+from app.schemas import (
+    AnalyzeRequest,
+    AnalyzeNewsRequest,
+    ArticleScoreResponse,
+    AnalyzeResponse,
+    LatestNewsResponse,
+    NewsPreviewResponse,
+)
+from app.services.image_service import get_news_image_url
+from app.services.news_fetcher import fetch_latest_articles
 from app.services.scoring_service import ScoringServiceError, analyze_article_relevance
-from app.tasks.article_scoring import score_article
-
-TRACKED_TASK_STATES = {"PENDING", "STARTED", "SUCCESS", "FAILURE"}
-USE_CELERY = os.getenv("USE_CELERY", "false").lower() in {"1", "true", "yes"}
-DIRECT_TASK_PREFIX = "score-"
-
-logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="News Article Scoring API",
@@ -42,6 +44,11 @@ async def list_scores(db: Session = Depends(get_db)) -> list[ArticleScoreRespons
             id=score.id,
             topic=score.topic,
             article=score.article,
+            source=score.source,
+            title=score.title,
+            published_at=score.published_at,
+            url=score.url,
+            image_url=score.image_url,
             relevance_score=score.relevance_score,
             confidence_score=score.confidence_score,
             short_reason=score.short_reason,
@@ -49,6 +56,93 @@ async def list_scores(db: Session = Depends(get_db)) -> list[ArticleScoreRespons
         )
         for score in scores
     ]
+
+
+@app.get("/latest-news", response_model=list[LatestNewsResponse])
+async def latest_news(
+    limit: int = 9,
+    category: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[LatestNewsResponse]:
+    scores = get_latest_news_scores(db, limit=max(1, min(limit, 100)), category=category)
+    return [
+        LatestNewsResponse(
+            id=score.id,
+            source=score.source,
+            title=score.title or score.article[:120],
+            article=score.article,
+            published_at=score.published_at,
+            url=score.url or "",
+            image_url=score.image_url,
+            topic=score.topic,
+            relevance_score=score.relevance_score,
+            confidence_score=score.confidence_score,
+            short_reason=score.short_reason,
+            created_at=score.created_at,
+        )
+        for score in scores
+        if score.url
+    ]
+
+
+@app.get("/news", response_model=list[NewsPreviewResponse])
+async def news_previews(category: str, limit: int = 9) -> list[NewsPreviewResponse]:
+    articles = await fetch_latest_articles(query=category, page_size=max(1, min(limit, 9)))
+    previews: list[NewsPreviewResponse] = []
+    for article in articles[: max(1, min(limit, 9))]:
+        previews.append(
+            NewsPreviewResponse(
+                source=article.source,
+                title=article.title,
+                article=article.text_for_scoring,
+                published_at=article.published_at,
+                url=article.url,
+                image_url=await get_news_image_url(article.title, category),
+            )
+        )
+
+    return sorted(previews, key=lambda preview: bool(preview.image_url), reverse=True)
+
+
+@app.post("/analyze-news", response_model=LatestNewsResponse)
+async def analyze_news(payload: AnalyzeNewsRequest, db: Session = Depends(get_db)) -> LatestNewsResponse:
+    existing_score = get_article_score_by_url(db, payload.url)
+    if existing_score is not None:
+        score = existing_score
+    else:
+        scoring_result = await analyze_article_relevance(topic=payload.topic, article=payload.article)
+        saved_score = create_ingested_article_score(
+            db,
+            topic=payload.topic,
+            article=payload.article,
+            source=payload.source,
+            title=payload.title,
+            published_at=payload.published_at,
+            url=payload.url,
+            image_url=payload.image_url,
+            scoring_result=scoring_result,
+        )
+        if saved_score is None:
+            score = get_article_score_by_url(db, payload.url)
+            if score is None:
+                raise HTTPException(status_code=409, detail="Article was already saved but could not be loaded.")
+        else:
+            score = saved_score
+
+    return LatestNewsResponse(
+        id=score.id,
+        source=score.source,
+        title=score.title or score.article[:120],
+        article=score.article,
+        published_at=score.published_at,
+        url=score.url or "",
+        image_url=score.image_url,
+        topic=score.topic,
+        relevance_score=score.relevance_score,
+        confidence_score=score.confidence_score,
+        short_reason=score.short_reason,
+        created_at=score.created_at,
+    )
 
 
 @app.delete("/scores/{score_id}")
@@ -60,106 +154,26 @@ async def delete_score(score_id: int, db: Session = Depends(get_db)) -> dict[str
     return {"deleted": True}
 
 
-@app.post("/analyze", response_model=TaskEnqueuedResponse)
-async def analyze_article(payload: AnalyzeRequest, db: Session = Depends(get_db)) -> TaskEnqueuedResponse:
-    if not USE_CELERY:
-        try:
-            scoring_result = await analyze_article_relevance(topic=payload.topic, article=payload.article)
-            saved_score = create_article_score(
-                db,
-                topic=payload.topic,
-                article=payload.article,
-                scoring_result=scoring_result,
-            )
-        except ScoringServiceError as exc:
-            logger.exception("Direct article scoring failed")
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except SQLAlchemyError as exc:
-            db.rollback()
-            logger.exception("Failed to store direct article score")
-            raise HTTPException(status_code=500, detail="Failed to store article score.") from exc
+@app.delete("/scores")
+async def delete_all_scores(db: Session = Depends(get_db)) -> dict[str, int]:
+    deleted_count = delete_all_article_scores(db)
+    return {"deleted": deleted_count}
 
-        return TaskEnqueuedResponse(task_id=f"{DIRECT_TASK_PREFIX}{saved_score.id}", status="SUCCESS")
 
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze_article(payload: AnalyzeRequest, db: Session = Depends(get_db)) -> AnalyzeResponse:
     try:
-        task = score_article.delay(topic=payload.topic, article=payload.article)
-    except (CeleryError, KombuError, RedisError, RuntimeError) as exc:
-        raise HTTPException(status_code=503, detail="Task queue unavailable.") from exc
+        scoring_result = await analyze_article_relevance(topic=payload.topic, article=payload.article)
+        create_article_score(db, topic=payload.topic, article=payload.article, scoring_result=scoring_result)
+    except ScoringServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to store article score.") from exc
 
-    return TaskEnqueuedResponse(task_id=task.id, status=task.status)
-
-
-@app.get("/task/{task_id}", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str, db: Session = Depends(get_db)) -> TaskStatusResponse:
-    if task_id.startswith(DIRECT_TASK_PREFIX):
-        score_id = _parse_direct_task_id(task_id)
-        if score_id is None:
-            return TaskStatusResponse(task_id=task_id, status="FAILURE", result={"error": "Invalid direct task id."})
-
-        score = get_article_score(db, score_id)
-        if score is None:
-            return TaskStatusResponse(task_id=task_id, status="FAILURE", result={"error": "Score not found."})
-
-        return TaskStatusResponse(task_id=task_id, status="SUCCESS", result=_article_score_to_dict(score))
-
-    try:
-        task = celery_app.AsyncResult(task_id)
-        status = task.status
-
-        result = None
-        if status == "SUCCESS":
-            result = task.result
-        elif status == "FAILURE":
-            result = _format_task_error(task.result)
-        elif status in {"PENDING", "STARTED"}:
-            result = None
-        elif task.ready():
-            result = _format_task_error(task.result)
-
-        if status not in TRACKED_TASK_STATES and task.ready():
-            status = "FAILURE"
-    except (CeleryError, KombuError, RedisError, RuntimeError) as exc:
-        raise HTTPException(status_code=503, detail="Task backend unavailable.") from exc
-
-    return TaskStatusResponse(task_id=task_id, status=status, result=result)
-
-
-def _parse_direct_task_id(task_id: str) -> int | None:
-    raw_score_id = task_id.removeprefix(DIRECT_TASK_PREFIX)
-    try:
-        return int(raw_score_id)
-    except ValueError:
-        return None
-
-
-def _article_score_to_dict(score: ArticleScore) -> dict[str, object]:
-    return {
-        "id": score.id,
-        "topic": score.topic,
-        "article": score.article,
-        "relevance_score": score.relevance_score,
-        "confidence_score": score.confidence_score,
-        "short_reason": score.short_reason,
-        "created_at": score.created_at.isoformat(),
-    }
-
-
-def _format_task_error(raw_result: object) -> dict[str, str]:
-    if isinstance(raw_result, dict):
-        if isinstance(raw_result.get("error"), str):
-            return {"error": raw_result["error"]}
-
-        exc_message = raw_result.get("exc_message")
-        if isinstance(exc_message, list) and exc_message:
-            return {"error": " ".join(str(part) for part in exc_message)}
-        if isinstance(exc_message, str):
-            return {"error": exc_message}
-
-    if isinstance(raw_result, BaseException):
-        message = str(raw_result) or raw_result.__class__.__name__
-    elif raw_result is None:
-        message = "Task failed."
-    else:
-        message = str(raw_result)
-
-    return {"error": message}
+    return AnalyzeResponse(
+        topic=payload.topic,
+        relevance_score=scoring_result.relevance_score,
+        confidence_score=scoring_result.confidence_score,
+        short_reason=scoring_result.short_reason,
+    )

@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArrowLeft, Clock, Database, FileText, RefreshCw, Trash2, TrendingUp } from "lucide-react";
+import { ArrowLeft, Clock, Database, FileText, Newspaper, RefreshCw, Trash2, TrendingUp } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { deleteScore, type ScoreResult } from "@/lib/api";
+import { deleteAllScores, deleteScore, type ScoreResult } from "@/lib/api";
 
 type HistoryResultsProps = {
   initialScores: ScoreResult[];
@@ -16,6 +16,7 @@ export function HistoryResults({ initialScores, initialError }: HistoryResultsPr
   const [scores, setScores] = useState(initialScores);
   const [error, setError] = useState(initialError);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [deletingAll, setDeletingAll] = useState(false);
 
   const summary = useMemo(() => {
     const averageRelevance =
@@ -50,6 +51,25 @@ export function HistoryResults({ initialScores, initialError }: HistoryResultsPr
     }
   }
 
+  async function handleDeleteAll() {
+    if (scores.length === 0 || deletingAll) return;
+
+    const confirmed = window.confirm(`Delete all ${scores.length} saved scores and ingested news records?`);
+    if (!confirmed) return;
+
+    setDeletingAll(true);
+    setError(null);
+
+    try {
+      await deleteAllScores();
+      setScores([]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to delete all scores.");
+    } finally {
+      setDeletingAll(false);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-[linear-gradient(180deg,#eef8f5_0%,#ffffff_38%,#f8fafc_100%)]">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
@@ -65,9 +85,15 @@ export function HistoryResults({ initialScores, initialError }: HistoryResultsPr
           </div>
           <div className="flex flex-col gap-2 sm:flex-row">
             <Button asChild variant="outline">
-              <Link href="/">
+              <Link href="/score">
                 <ArrowLeft className="h-4 w-4" />
-                Dashboard
+                Score
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link href="/">
+                <Newspaper className="h-4 w-4" />
+                Latest News
               </Link>
             </Button>
             <Button asChild>
@@ -75,6 +101,16 @@ export function HistoryResults({ initialScores, initialError }: HistoryResultsPr
                 <RefreshCw className="h-4 w-4" />
                 Refresh
               </Link>
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={scores.length === 0 || deletingAll}
+              onClick={handleDeleteAll}
+              className="border-destructive/30 text-destructive hover:bg-destructive/5"
+            >
+              <Trash2 className="h-4 w-4" />
+              {deletingAll ? "Deleting" : "Delete All"}
             </Button>
           </div>
         </header>
@@ -146,7 +182,7 @@ export function HistoryResults({ initialScores, initialError }: HistoryResultsPr
                           type="button"
                           variant="outline"
                           size="sm"
-                          disabled={deletingId === score.id}
+                          disabled={deletingId === score.id || deletingAll}
                           onClick={() => handleDelete(score.id)}
                           className="border-destructive/30 text-destructive hover:bg-destructive/5"
                           title="Delete score"

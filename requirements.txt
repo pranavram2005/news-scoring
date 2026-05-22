@@ -1,11 +1,9 @@
 alembic
-celery
 fastapi
 groq
 httpx
 psycopg[binary]
 python-dotenv
-redis
 SQLAlchemy
 truststore
 uvicorn[standard]
